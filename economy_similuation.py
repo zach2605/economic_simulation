@@ -24,6 +24,9 @@ class Household(mesa.Agent):
         self.savings = self.wage * 2.0
 
     def step(self):
+        # Wages track the model's current (tightness-adjusted) wage rates
+        self.wage = self.model.wage_rates[self.labor_class]
+
         # Voluntary turnover (1% per tick)
         if self.employer is not None and random.random() < 0.01:
             self.employer.employees.remove(self)
@@ -40,20 +43,29 @@ class Household(mesa.Agent):
             net_income = income - tax
             self.model.treasury_balance += tax
 
-        self.savings += net_income
+        # Interest rate sensitivity on spending (Baseline MPC = 82%)
+        # Widened multiplier so the full rate slider range produces a
+        # meaningful swing in spending behavior (previously too weak
+        # relative to the employment feedback loop).
+        rate_impact = (self.model.interest_rate - 0.035) * 5.0
+        effective_mpc = max(0.50, min(0.95, 0.82 - rate_impact))
 
-        # Interest rate sensitivity on spending
-        # Baseline MPC = 78%. Higher interest rates lower MPC (encourage saving)
-        rate_impact = (self.model.interest_rate - 0.035) * 3.5
-        effective_mpc = max(0.50, min(0.90, 0.78 - rate_impact))
+        # Spending & Savings Math
+        income_spent = net_income * effective_mpc
+        savings_spent = self.savings * 0.02
+        consumption = income_spent + savings_spent
 
-        consumption = (net_income * effective_mpc) + (self.savings * 0.02)
-        self.savings -= consumption
+        # Correctly update savings pool (Income saved minus savings drawn)
+        income_saved = net_income * (1.0 - effective_mpc)
+        self.savings = (self.savings - savings_spent) + income_saved
+
         self.model.period_gdp += consumption
 
-        firms = [a for a in self.model.agents if isinstance(a, Firm)]
+        firms = self.model.firms
         if firms and consumption > 0:
-            chosen_firm = random.choice(firms)
+            # Weight customer spending by firm capacity
+            firm_weights = [f.capacity for f in firms]
+            chosen_firm = random.choices(firms, weights=firm_weights, k=1)[0]
             chosen_firm.revenue += consumption
 
 
@@ -65,9 +77,9 @@ class Firm(mesa.Agent):
 
         # Calibrated capacities: Total equilibrium sum ~ 950 jobs (5% NAIRU)
         tier_config = {
-            "small": {"init_cap": 7, "min_cap": 2, "hr": 2},  # 28 * 7 = 196
-            "medium": {"init_cap": 22, "min_cap": 6, "hr": 4},  # 14 * 22 = 308
-            "large": {"init_cap": 75, "min_cap": 18, "hr": 10},  # 6 * 75 = 450
+            "small": {"init_cap": 7, "min_cap": 2, "hr": 1},    # throttled hr
+            "medium": {"init_cap": 22, "min_cap": 6, "hr": 2},  # throttled hr
+            "large": {"init_cap": 75, "min_cap": 18, "hr": 5},  # throttled hr
         }
 
         config = tier_config[firm_size_tier]
@@ -77,7 +89,10 @@ class Firm(mesa.Agent):
 
         self.employees = []
         self.revenue = 0.0
-        self.smoothed_sales = 0.0
+
+        # Pre-warm sales memory aligned with aggregate household spending ($24.50)
+        init_rev_per_worker = 24.50
+        self.smoothed_sales = self.capacity * init_rev_per_worker
 
     def step(self):
         # Smoothed sales memory
@@ -88,29 +103,37 @@ class Firm(mesa.Agent):
                 0.7 * self.smoothed_sales + 0.3 * self.revenue
             )
 
-        avg_wage = self.model.get_average_wage()
-
-        # Debt Service / CapEx Burden from Policy Interest Rate
-        capital_cost_burden = 1.0 + (self.model.interest_rate * 2.2)
-        required_rev_per_worker = avg_wage * capital_cost_burden * 1.05
+        # Required revenue per worker: cost of capital component (interest
+        # rate), a wage component so rising labor costs from a tight market
+        # feed into hiring decisions, and a corp-tax component so higher
+        # corporate tax makes firms need more pre-tax revenue to justify
+        # each additional worker (lower tax -> easier to justify hiring).
+        capital_cost_burden = 1.0 + ((self.model.interest_rate - 0.035) * 4.0)
+        wage_burden = self.model.wage_index  # 1.0 at baseline tightness
+        tax_burden = 1.0 + ((self.model.corp_tax_rate - 0.20) * 1.2)
+        required_rev_per_worker = (
+            24.50 * capital_cost_burden * wage_burden * tax_burden
+        )
 
         target_cap = max(
             self.min_cap, int(self.smoothed_sales / required_rev_per_worker)
         )
 
-        # Capacity adjustments
+        # Capacity adjustments (Rate-limited by hr_limit, now throttled)
         if target_cap > self.capacity:
             self.capacity += min(self.hr_limit, target_cap - self.capacity)
         elif target_cap < self.capacity:
-            self.capacity = max(self.min_cap, target_cap)
+            self.capacity = max(self.min_cap, self.capacity - self.hr_limit, target_cap)
             if len(self.employees) > self.capacity:
                 excess = len(self.employees) - self.capacity
-                layoffs = random.sample(self.employees, excess)
+                layoffs = random.sample(self.employees, min(excess, self.hr_limit))
                 for w in layoffs:
                     w.employer = None
                     self.employees.remove(w)
 
-        # Hiring from pool
+        # Hiring from unemployed pool (throttled by hr_limit, same as before,
+        # but hr_limit values are now smaller so the market can't saturate
+        # in a single tick)
         unemployed = [
             a
             for a in self.model.agents
@@ -143,8 +166,8 @@ class EconomyModel(mesa.Model):
         super().__init__()
         self.num_households = num_households
         self.treasury_balance = 35000.0
-        self.period_gdp = 0.0
-        self.prev_gdp = 29000.0
+        self.period_gdp = 24500.0
+        self.prev_gdp = 24500.0
 
         # Interactive Policy Levers
         self.interest_rate = 0.035
@@ -152,7 +175,11 @@ class EconomyModel(mesa.Model):
         self.corp_tax_rate = 0.20
         self.ei_benefit = 15.00
 
-        self.wage_rates = {"lower": 18.00, "middle": 38.00, "upper": 88.00}
+        # Base wages (fixed reference point); actual wage_rates paid out
+        # flex around this based on labor market tightness each tick.
+        self.base_wage_rates = {"lower": 18.00, "middle": 38.00, "upper": 88.00}
+        self.wage_rates = dict(self.base_wage_rates)
+        self.wage_index = 1.0  # multiplier firms see on required revenue
 
         # Setup Firms
         firm_distribution = (
@@ -174,7 +201,7 @@ class EconomyModel(mesa.Model):
             self.agents.add(h)
             households.append(h)
 
-        # Employ ~950 households initially (5% baseline unemployment)
+        # Employ ~950 households initially (5% baseline NAIRU)
         employed_targets = random.sample(households, 950)
         for h in employed_targets:
             avail = [f for f in self.firms if len(f.employees) < f.capacity]
@@ -197,11 +224,12 @@ class EconomyModel(mesa.Model):
                 ),
                 "GDP ($)": lambda m: round(m.period_gdp, 2),
                 "Treasury ($)": lambda m: round(m.treasury_balance, 2),
+                "Wage Index": lambda m: round(m.wage_index, 3),
             }
         )
 
-    def get_average_wage(self):
-        return 34.00
+        # Collect baseline state snapshot at Tick 0
+        self.datacollector.collect(self)
 
     def calculate_unemployment(self):
         households = [a for a in self.agents if isinstance(a, Household)]
@@ -220,9 +248,26 @@ class EconomyModel(mesa.Model):
         inflation = 0.02 + (tightness * 0.7) + (gdp_growth * 0.2)
         return max(-0.01, min(0.09, inflation))
 
+    def update_wages(self):
+        """Wage stabilizer: tight labor market pushes wages (and required
+        firm revenue-per-worker) up, which is the missing brake that
+        previously let the hiring loop run away unchecked. Loose labor
+        market lets wages/wage_index drift back down."""
+        u = self.calculate_unemployment()
+        tightness = 0.05 - u  # positive = tight market, negative = slack
+        target_index = 1.0 + max(-0.35, min(0.35, tightness * 3.0))
+        # Smooth adjustment so wages don't jump discontinuously tick to tick
+        self.wage_index = 0.9 * self.wage_index + 0.1 * target_index
+        for k in self.wage_rates:
+            self.wage_rates[k] = self.base_wage_rates[k] * self.wage_index
+
     def step(self):
-        self.prev_gdp = self.period_gdp if self.period_gdp > 0 else 29000.0
+        self.prev_gdp = self.period_gdp if self.period_gdp > 0 else 24500.0
         self.period_gdp = 0.0
+
+        # Update wages BEFORE households/firms act this tick, based on
+        # last tick's unemployment reading.
+        self.update_wages()
 
         # Fiscal spending capped at a sustainable 2% of treasury
         gov_spending = max(0, self.treasury_balance * 0.02)
@@ -233,7 +278,14 @@ class EconomyModel(mesa.Model):
                 f.revenue += per_firm
             self.period_gdp += gov_spending
 
-        self.agents.shuffle_do("step")
+        # Two-phase deterministic stepping: ALL households spend/earn
+        # before ANY firm reacts to that revenue. Previously shuffle_do
+        # interleaved households and firms randomly, so some firms saw
+        # partial/incomplete revenue for the tick, injecting noise
+        # unrelated to policy levers.
+        self.agents_by_type[Household].shuffle_do("step")
+        self.agents_by_type[Firm].shuffle_do("step")
+
         self.datacollector.collect(self)
 
 
@@ -300,17 +352,15 @@ model.income_tax_rate = income_tax
 model.corp_tax_rate = corp_tax
 model.ei_benefit = ei_benefit
 
-col_btn1, col_btn2, col_btn3 = st.sidebar.columns(3)
-if col_btn1.button("▶ Step 1 Tick"):
-    model.step()
-    st.session_state.tick_count += 1
+st.sidebar.caption("1 tick = 1 quarter · each step advances 1 year (4 ticks)")
 
-if col_btn2.button("⏩ Run 10 Ticks"):
-    for _ in range(10):
+col_btn1, col_btn2 = st.sidebar.columns(2)
+if col_btn1.button("▶ Advance 1 Year"):
+    for _ in range(4):
         model.step()
         st.session_state.tick_count += 1
 
-if col_btn3.button("🔄 Reset"):
+if col_btn2.button("🔄 Reset"):
     st.session_state.model = EconomyModel()
     st.session_state.tick_count = 0
     st.rerun()
@@ -339,8 +389,10 @@ if not df.empty:
             df,
             y=["Unemployment (%)", "Interest Rate (%)"],
             title="Unemployment vs Policy Rate",
+            labels={"index": "Quarter", "value": "Percent (%)", "variable": "Metric"},
         )
-        st.plotly_chart(fig1, width=True)
+        fig1.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig1, width="stretch")
 
     with c2:
         st.subheader("Economic Output & Inflation")
@@ -348,10 +400,12 @@ if not df.empty:
             df,
             y=["GDP Growth (%)", "Inflation Rate (%)"],
             title="GDP Growth Rate vs Inflation",
+            labels={"index": "Quarter", "value": "Percent (%)", "variable": "Metric"},
         )
-        st.plotly_chart(fig2, width=True)
+        fig2.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig2, width="stretch")
 
     st.subheader("Simulation Ledger")
-    st.dataframe(df.tail(15), width=True)
+    st.dataframe(df.tail(15), width="stretch")
 else:
     st.info("Click **Step 1 Tick** or **Run 10 Ticks** in the sidebar to begin.")
