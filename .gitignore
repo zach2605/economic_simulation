@@ -1,0 +1,46 @@
+# ==========================================
+# 1. Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+
+# ==========================================
+# 2. Python Bytecode & Cache Files
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================================
+# 3. Streamlit & App Secrets
+# ==========================================
+.streamlit/secrets.toml
+.env
+
+# ==========================================
+# 4. IDE & Editor Files
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+
+# ==========================================
+# 5. OS Generated Files
+# ==========================================
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+.DS_Store
+
+# ==========================================
+# 6. Build / Distribution Artifacts
+# ==========================================
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
