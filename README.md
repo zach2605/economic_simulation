@@ -211,4 +211,4 @@ of the `EconomyModel` class for easy retuning:
   through a separate investment/capital-stock channel.
 
 
-## Generated with help of claude
+*Generated with help of Claude.*
