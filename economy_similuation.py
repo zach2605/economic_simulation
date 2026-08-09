@@ -1,5 +1,4 @@
 import random
-import mesa
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -9,284 +8,131 @@ st.set_page_config(
     page_title="Canada Macro Policy Simulator", layout="wide"
 )
 
-# Set random seed for reproducible runs
+# Fixed seed so shocks are reproducible run-to-run for a given policy path
 random.seed(42)
 
 
-# --- AGENT DEFINITIONS ---
-class Household(mesa.Agent):
+class EconomyModel:
+    """Reduced-form macro model: IS curve (demand) + Phillips curve
+    (inflation) + Okun's law (unemployment), with a lagged monetary
+    transmission channel. This replaces the old agent-based version so
+    that interest-rate changes produce the textbook, predictable
+    transmission a policy simulator needs, instead of emergent noise
+    from thousands of individual hiring/spending decisions.
+    """
 
-    def __init__(self, model, labor_class):
-        super().__init__(model)
-        self.labor_class = labor_class
-        self.wage = model.wage_rates[labor_class]
-        self.employer = None
-        self.savings = self.wage * 2.0
+    # --- Structural calibration (not player-controlled) ---
+    POTENTIAL_GROWTH_Q = 0.005      # ~2%/yr potential growth, compounded quarterly
+    NEUTRAL_REAL_RATE = 2.0         # % - real policy rate consistent with stable inflation
+    TARGET_INFLATION = 2.0          # % - central bank's inflation target
+    NATURAL_UNEMPLOYMENT = 5.0      # % - NAIRU
+    LABOR_SHARE = 0.55              # share of quarterly output subject to income tax
+    PROFIT_SHARE = 0.15             # share of quarterly output subject to corp tax
+    GOV_SPENDING_SHARE = 0.15       # baseline non-EI government spending, % of output
+    RATE_LAG_QUARTERS = 2           # monetary policy transmission lag
+
+    # Baselines fiscal levers are compared against, to compute stimulus/drag
+    BASE_INCOME_TAX = 20.0
+    BASE_CORP_TAX = 20.0
+    BASE_EI_BENEFIT = 3.0
+
+    def __init__(self):
+        # Policy levers (player controlled) - sensible starting stance
+        self.interest_rate = 4.0        # nominal rate; real = 4.0 - 2.0 = neutral
+        self.income_tax_rate = self.BASE_INCOME_TAX
+        self.corp_tax_rate = self.BASE_CORP_TAX
+        self.ei_benefit = self.BASE_EI_BENEFIT   # $B / quarter per 1pt of unemployment
+
+        # State
+        self.quarter = 0
+        self.output_gap = 0.0
+        self.inflation = self.TARGET_INFLATION
+        self.unemployment = self.NATURAL_UNEMPLOYMENT
+        self.potential_gdp = 2100.0     # $B, annualized (~ Canada-scale)
+        self.gdp = 2100.0
+        self.debt = 1200.0              # $B, federal debt level
+        self._last_growth = 0.0
+
+        # Real-rate history, needed for the lagged transmission channel
+        self.rate_history = [self.interest_rate - self.inflation]
+
+        self.history = []
+        self._record()
+
+    def _record(self):
+        self.history.append({
+            "Quarter": self.quarter,
+            "Interest Rate (%)": round(self.interest_rate, 2),
+            "Unemployment (%)": round(self.unemployment, 2),
+            "Inflation (%)": round(self.inflation, 2),
+            "GDP Growth (%)": round(self._last_growth, 2),
+            "GDP ($B)": round(self.gdp, 1),
+            "Federal Debt ($B)": round(self.debt, 1),
+            "Output Gap (%)": round(self.output_gap, 2),
+        })
 
     def step(self):
-        # Wages track the model's current (tightness-adjusted) wage rates
-        self.wage = self.model.wage_rates[self.labor_class]
+        self.quarter += 1
 
-        # Voluntary turnover (1% per tick)
-        if self.employer is not None and random.random() < 0.01:
-            self.employer.employees.remove(self)
-            self.employer = None
-
-        # Income calculation
-        if self.employer is None:
-            income = self.model.ei_benefit
-            self.model.treasury_balance -= self.model.ei_benefit
-            net_income = income
+        # --- Monetary transmission (lagged real interest rate) ---
+        expected_inflation = self.inflation  # adaptive expectations
+        real_rate_now = self.interest_rate - expected_inflation
+        self.rate_history.append(real_rate_now)
+        if len(self.rate_history) > self.RATE_LAG_QUARTERS:
+            real_rate_effective = self.rate_history[-1 - self.RATE_LAG_QUARTERS]
         else:
-            income = self.wage
-            tax = income * self.model.income_tax_rate
-            net_income = income - tax
-            self.model.treasury_balance += tax
+            real_rate_effective = self.NEUTRAL_REAL_RATE
 
-        # Interest rate sensitivity on spending (Baseline MPC = 82%)
-        # Widened multiplier so the full rate slider range produces a
-        # meaningful swing in spending behavior (previously too weak
-        # relative to the employment feedback loop).
-        rate_impact = (self.model.interest_rate - 0.035) * 5.0
-        effective_mpc = max(0.50, min(0.95, 0.82 - rate_impact))
-
-        # Spending & Savings Math
-        income_spent = net_income * effective_mpc
-        savings_spent = self.savings * 0.02
-        consumption = income_spent + savings_spent
-
-        # Correctly update savings pool (Income saved minus savings drawn)
-        income_saved = net_income * (1.0 - effective_mpc)
-        self.savings = (self.savings - savings_spent) + income_saved
-
-        self.model.period_gdp += consumption
-
-        firms = self.model.firms
-        if firms and consumption > 0:
-            # Weight customer spending by firm capacity
-            firm_weights = [f.capacity for f in firms]
-            chosen_firm = random.choices(firms, weights=firm_weights, k=1)[0]
-            chosen_firm.revenue += consumption
-
-
-class Firm(mesa.Agent):
-
-    def __init__(self, model, firm_size_tier):
-        super().__init__(model)
-        self.firm_size_tier = firm_size_tier
-
-        # Calibrated capacities: Total equilibrium sum ~ 950 jobs (5% NAIRU)
-        tier_config = {
-            "small": {"init_cap": 7, "min_cap": 2, "hr": 1},    # throttled hr
-            "medium": {"init_cap": 22, "min_cap": 6, "hr": 2},  # throttled hr
-            "large": {"init_cap": 75, "min_cap": 18, "hr": 5},  # throttled hr
-        }
-
-        config = tier_config[firm_size_tier]
-        self.capacity = config["init_cap"]
-        self.min_cap = config["min_cap"]
-        self.hr_limit = config["hr"]
-
-        self.employees = []
-        self.revenue = 0.0
-
-        # Pre-warm sales memory aligned with aggregate household spending ($24.50)
-        init_rev_per_worker = 24.50
-        self.smoothed_sales = self.capacity * init_rev_per_worker
-
-    def step(self):
-        # Smoothed sales memory
-        if self.smoothed_sales == 0:
-            self.smoothed_sales = self.revenue
-        else:
-            self.smoothed_sales = (
-                0.7 * self.smoothed_sales + 0.3 * self.revenue
-            )
-
-        # Required revenue per worker: cost of capital component (interest
-        # rate), a wage component so rising labor costs from a tight market
-        # feed into hiring decisions, and a corp-tax component so higher
-        # corporate tax makes firms need more pre-tax revenue to justify
-        # each additional worker (lower tax -> easier to justify hiring).
-        capital_cost_burden = 1.0 + ((self.model.interest_rate - 0.035) * 4.0)
-        wage_burden = self.model.wage_index  # 1.0 at baseline tightness
-        tax_burden = 1.0 + ((self.model.corp_tax_rate - 0.20) * 1.2)
-        required_rev_per_worker = (
-            24.50 * capital_cost_burden * wage_burden * tax_burden
+        # --- Fiscal impulse from tax/benefit levers (deviation from baseline) ---
+        fiscal_impulse = (
+            0.06 * (self.BASE_INCOME_TAX - self.income_tax_rate)   # tax cut -> stimulus
+            + 0.15 * (self.ei_benefit - self.BASE_EI_BENEFIT)      # richer EI -> stimulus
+            + 0.02 * (self.BASE_CORP_TAX - self.corp_tax_rate)     # corp tax cut -> mild stimulus
         )
 
-        target_cap = max(
-            self.min_cap, int(self.smoothed_sales / required_rev_per_worker)
+        demand_shock = random.gauss(0, 0.08)
+
+        # --- IS curve: output gap ---
+        self.output_gap = (
+            0.75 * self.output_gap
+            - 0.55 * (real_rate_effective - self.NEUTRAL_REAL_RATE)
+            + fiscal_impulse
+            + demand_shock
         )
+        self.output_gap = max(-10.0, min(10.0, self.output_gap))
 
-        # Capacity adjustments (Rate-limited by hr_limit, now throttled)
-        if target_cap > self.capacity:
-            self.capacity += min(self.hr_limit, target_cap - self.capacity)
-        elif target_cap < self.capacity:
-            self.capacity = max(self.min_cap, self.capacity - self.hr_limit, target_cap)
-            if len(self.employees) > self.capacity:
-                excess = len(self.employees) - self.capacity
-                layoffs = random.sample(self.employees, min(excess, self.hr_limit))
-                for w in layoffs:
-                    w.employer = None
-                    self.employees.remove(w)
-
-        # Hiring from unemployed pool (throttled by hr_limit, same as before,
-        # but hr_limit values are now smaller so the market can't saturate
-        # in a single tick)
-        unemployed = [
-            a
-            for a in self.model.agents
-            if isinstance(a, Household) and a.employer is None
-        ]
-        vacancies = self.capacity - len(self.employees)
-
-        if vacancies > 0 and unemployed:
-            hires = random.sample(
-                unemployed, min(len(unemployed), vacancies, self.hr_limit)
-            )
-            for w in hires:
-                w.employer = self
-                self.employees.append(w)
-
-        # Operations & Corporate Tax
-        payroll = sum(e.wage for e in self.employees)
-        profit = self.revenue - payroll
-
-        if profit > 0:
-            corp_tax = profit * self.model.corp_tax_rate
-            self.model.treasury_balance += corp_tax
-
-        self.revenue = 0.0
-
-
-class EconomyModel(mesa.Model):
-
-    def __init__(self, num_households=1000):
-        super().__init__()
-        self.num_households = num_households
-        self.treasury_balance = 35000.0
-        self.period_gdp = 24500.0
-        self.prev_gdp = 24500.0
-
-        # Interactive Policy Levers
-        self.interest_rate = 0.035
-        self.income_tax_rate = 0.20
-        self.corp_tax_rate = 0.20
-        self.ei_benefit = 15.00
-
-        # Base wages (fixed reference point); actual wage_rates paid out
-        # flex around this based on labor market tightness each tick.
-        self.base_wage_rates = {"lower": 18.00, "middle": 38.00, "upper": 88.00}
-        self.wage_rates = dict(self.base_wage_rates)
-        self.wage_index = 1.0  # multiplier firms see on required revenue
-
-        # Setup Firms
-        firm_distribution = (
-            ["small"] * 28 + ["medium"] * 14 + ["large"] * 6
+        # --- Phillips curve: inflation ---
+        supply_shock = random.gauss(0, 0.05)
+        self.inflation = (
+            0.65 * self.inflation
+            + 0.35 * self.TARGET_INFLATION
+            + 0.30 * self.output_gap
+            + supply_shock
         )
-        self.firms = []
-        for size in firm_distribution:
-            f = Firm(self, size)
-            self.agents.add(f)
-            self.firms.append(f)
+        self.inflation = max(-2.0, min(12.0, self.inflation))
 
-        # Setup Households
-        class_distribution = (
-            ["lower"] * 450 + ["middle"] * 450 + ["upper"] * 100
-        )
-        households = []
-        for labor_class in class_distribution:
-            h = Household(self, labor_class)
-            self.agents.add(h)
-            households.append(h)
+        # --- Okun's law: unemployment ---
+        self.unemployment = self.NATURAL_UNEMPLOYMENT - 0.5 * self.output_gap
+        self.unemployment = max(1.0, min(20.0, self.unemployment))
 
-        # Employ ~950 households initially (5% baseline NAIRU)
-        employed_targets = random.sample(households, 950)
-        for h in employed_targets:
-            avail = [f for f in self.firms if len(f.employees) < f.capacity]
-            if avail:
-                f = random.choice(avail)
-                h.employer = f
-                f.employees.append(h)
+        # --- GDP level (annualized), potential compounds, actual tracks the gap ---
+        prev_gdp = self.gdp
+        self.potential_gdp *= (1 + self.POTENTIAL_GROWTH_Q)
+        self.gdp = self.potential_gdp * (1 + self.output_gap / 100.0)
+        self._last_growth = ((self.gdp / prev_gdp) ** 4 - 1) * 100.0  # annualized
 
-        self.datacollector = mesa.DataCollector(
-            model_reporters={
-                "Unemployment (%)": lambda m: round(
-                    m.calculate_unemployment() * 100, 2
-                ),
-                "Interest Rate (%)": lambda m: round(m.interest_rate * 100, 2),
-                "Inflation Rate (%)": lambda m: round(
-                    m.calculate_inflation() * 100, 2
-                ),
-                "GDP Growth (%)": lambda m: round(
-                    m.calculate_gdp_growth() * 100, 2
-                ),
-                "GDP ($)": lambda m: round(m.period_gdp, 2),
-                "Treasury ($)": lambda m: round(m.treasury_balance, 2),
-                "Wage Index": lambda m: round(m.wage_index, 3),
-            }
-        )
+        # --- Federal debt: revenue vs spending vs interest owed ---
+        quarterly_output = self.gdp / 4.0
+        income_tax_rev = (self.income_tax_rate / 100.0) * self.LABOR_SHARE * quarterly_output
+        corp_tax_rev = (self.corp_tax_rate / 100.0) * self.PROFIT_SHARE * quarterly_output
+        gov_other_spend = self.GOV_SPENDING_SHARE * quarterly_output
+        ei_spend = self.ei_benefit * self.unemployment
+        interest_on_debt = self.debt * (self.interest_rate / 100.0) / 4.0
 
-        # Collect baseline state snapshot at Tick 0
-        self.datacollector.collect(self)
+        primary_balance = income_tax_rev + corp_tax_rev - gov_other_spend - ei_spend
+        self.debt = self.debt - primary_balance + interest_on_debt
 
-    def calculate_unemployment(self):
-        households = [a for a in self.agents if isinstance(a, Household)]
-        unemployed = sum(1 for h in households if h.employer is None)
-        return unemployed / len(households)
-
-    def calculate_gdp_growth(self):
-        if self.prev_gdp <= 0:
-            return 0.0
-        return ((self.period_gdp - self.prev_gdp) / self.prev_gdp)
-
-    def calculate_inflation(self):
-        u = self.calculate_unemployment()
-        tightness = 0.05 - u  # Phillips Curve pressure relative to 5% NAIRU
-        gdp_growth = self.calculate_gdp_growth()
-        inflation = 0.02 + (tightness * 0.7) + (gdp_growth * 0.2)
-        return max(-0.01, min(0.09, inflation))
-
-    def update_wages(self):
-        """Wage stabilizer: tight labor market pushes wages (and required
-        firm revenue-per-worker) up, which is the missing brake that
-        previously let the hiring loop run away unchecked. Loose labor
-        market lets wages/wage_index drift back down."""
-        u = self.calculate_unemployment()
-        tightness = 0.05 - u  # positive = tight market, negative = slack
-        target_index = 1.0 + max(-0.35, min(0.35, tightness * 3.0))
-        # Smooth adjustment so wages don't jump discontinuously tick to tick
-        self.wage_index = 0.9 * self.wage_index + 0.1 * target_index
-        for k in self.wage_rates:
-            self.wage_rates[k] = self.base_wage_rates[k] * self.wage_index
-
-    def step(self):
-        self.prev_gdp = self.period_gdp if self.period_gdp > 0 else 24500.0
-        self.period_gdp = 0.0
-
-        # Update wages BEFORE households/firms act this tick, based on
-        # last tick's unemployment reading.
-        self.update_wages()
-
-        # Fiscal spending capped at a sustainable 2% of treasury
-        gov_spending = max(0, self.treasury_balance * 0.02)
-        if gov_spending > 0 and self.firms:
-            self.treasury_balance -= gov_spending
-            per_firm = gov_spending / len(self.firms)
-            for f in self.firms:
-                f.revenue += per_firm
-            self.period_gdp += gov_spending
-
-        # Two-phase deterministic stepping: ALL households spend/earn
-        # before ANY firm reacts to that revenue. Previously shuffle_do
-        # interleaved households and firms randomly, so some firms saw
-        # partial/incomplete revenue for the tick, injecting noise
-        # unrelated to policy levers.
-        self.agents_by_type[Household].shuffle_do("step")
-        self.agents_by_type[Firm].shuffle_do("step")
-
-        self.datacollector.collect(self)
+        self._record()
 
 
 # --- STREAMLIT DASHBOARD UI ---
@@ -298,52 +144,42 @@ st.markdown(
 # Initialize Session State for Model Persistence
 if "model" not in st.session_state:
     st.session_state.model = EconomyModel()
-    st.session_state.tick_count = 0
 
 model = st.session_state.model
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("🎛️ Policy Levers")
 
-interest_rate = (
-    st.sidebar.slider(
-        "Central Bank Policy Rate (%)",
-        min_value=0.25,
-        max_value=10.00,
-        value=float(model.interest_rate * 100),
-        step=0.25,
-    )
-    / 100.0
+interest_rate = st.sidebar.slider(
+    "Central Bank Policy Rate (%)",
+    min_value=0.25,
+    max_value=10.00,
+    value=float(model.interest_rate),
+    step=0.25,
 )
 
-income_tax = (
-    st.sidebar.slider(
-        "Income Tax Rate (%)",
-        min_value=5.0,
-        max_value=45.0,
-        value=float(model.income_tax_rate * 100),
-        step=1.0,
-    )
-    / 100.0
+income_tax = st.sidebar.slider(
+    "Income Tax Rate (%)",
+    min_value=5.0,
+    max_value=45.0,
+    value=float(model.income_tax_rate),
+    step=1.0,
 )
 
-corp_tax = (
-    st.sidebar.slider(
-        "Corporate Tax Rate (%)",
-        min_value=5.0,
-        max_value=40.0,
-        value=float(model.corp_tax_rate * 100),
-        step=1.0,
-    )
-    / 100.0
+corp_tax = st.sidebar.slider(
+    "Corporate Tax Rate (%)",
+    min_value=5.0,
+    max_value=40.0,
+    value=float(model.corp_tax_rate),
+    step=1.0,
 )
 
 ei_benefit = st.sidebar.slider(
-    "EI Benefit ($ / tick)",
-    min_value=5.0,
-    max_value=40.0,
+    "EI Benefit ($B / quarter per 1pt unemployment)",
+    min_value=1.0,
+    max_value=10.0,
     value=float(model.ei_benefit),
-    step=1.0,
+    step=0.5,
 )
 
 # Apply Control Settings to Active Model
@@ -352,31 +188,32 @@ model.income_tax_rate = income_tax
 model.corp_tax_rate = corp_tax
 model.ei_benefit = ei_benefit
 
-st.sidebar.caption("1 tick = 1 quarter · each step advances 1 year (4 ticks)")
+st.sidebar.caption(
+    "1 tick = 1 quarter · each step advances 1 year (4 ticks). "
+    "Rate changes take ~2 quarters to fully hit the economy, like real policy lags."
+)
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
 if col_btn1.button("▶ Advance 1 Year"):
     for _ in range(4):
         model.step()
-        st.session_state.tick_count += 1
 
 if col_btn2.button("🔄 Reset"):
     st.session_state.model = EconomyModel()
-    st.session_state.tick_count = 0
     st.rerun()
 
 # --- MAIN DISPLAY METRICS ---
-df = model.datacollector.get_model_vars_dataframe()
+df = pd.DataFrame(model.history)
 
-if not df.empty:
+if len(df) > 1:
     latest = df.iloc[-1]
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Unemployment", f"{latest['Unemployment (%)']}%")
     m2.metric("GDP Growth", f"{latest['GDP Growth (%)']}%")
-    m3.metric("Inflation", f"{latest['Inflation Rate (%)']}%")
-    m4.metric("GDP Level", f"${latest['GDP ($)']:,.2f}")
-    m5.metric("Treasury", f"${latest['Treasury ($)']:,.2f}")
+    m3.metric("Inflation", f"{latest['Inflation (%)']}%")
+    m4.metric("GDP Level", f"${latest['GDP ($B)']:,.1f}B")
+    m5.metric("Federal Debt", f"${latest['Federal Debt ($B)']:,.1f}B")
 
     st.divider()
 
@@ -387,25 +224,32 @@ if not df.empty:
         st.subheader("Labor Market & Interest Rates")
         fig1 = px.line(
             df,
+            x="Quarter",
             y=["Unemployment (%)", "Interest Rate (%)"],
             title="Unemployment vs Policy Rate",
-            labels={"index": "Quarter", "value": "Percent (%)", "variable": "Metric"},
+            labels={"value": "Percent (%)", "variable": "Metric"},
         )
-        fig1.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+        fig1.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=40))
+        n_quarters = len(df)
+        dtick1 = max(1, round(n_quarters / 10))
+        fig1.update_xaxes(dtick=dtick1, tick0=0, tickformat="d")
         st.plotly_chart(fig1, width="stretch")
 
     with c2:
         st.subheader("Economic Output & Inflation")
         fig2 = px.line(
             df,
-            y=["GDP Growth (%)", "Inflation Rate (%)"],
+            x="Quarter",
+            y=["GDP Growth (%)", "Inflation (%)"],
             title="GDP Growth Rate vs Inflation",
-            labels={"index": "Quarter", "value": "Percent (%)", "variable": "Metric"},
+            labels={"value": "Percent (%)", "variable": "Metric"},
         )
-        fig2.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+        fig2.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=40))
+        dtick2 = max(1, round(n_quarters / 10))
+        fig2.update_xaxes(dtick=dtick2, tick0=0, tickformat="d")
         st.plotly_chart(fig2, width="stretch")
 
     st.subheader("Simulation Ledger")
     st.dataframe(df.tail(15), width="stretch")
 else:
-    st.info("Click **Step 1 Tick** or **Run 10 Ticks** in the sidebar to begin.")
+    st.info("Click **Advance 1 Year** in the sidebar to begin.")
