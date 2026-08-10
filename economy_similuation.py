@@ -292,4 +292,4 @@ if len(df) > 1:
     st.subheader("Simulation Ledger")
     st.dataframe(df.tail(15), width="stretch")
 else:
-    st.info("Click **Advance 1 Year** in the sidebar to begin.")
+    st.info("Click ▶ 1 Quarter or ▶▶ 1 Year in the sidebar to begin.")
