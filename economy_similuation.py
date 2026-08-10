@@ -52,6 +52,7 @@ class EconomyModel:
         self.gdp = 2100.0
         self.debt = 1200.0              # $B, federal debt level
         self._last_growth = 0.0
+        self._last_primary_balance = 0.0
 
         # Real-rate history, needed for the lagged transmission channel
         self.rate_history = [self.interest_rate - self.inflation]
@@ -63,11 +64,14 @@ class EconomyModel:
         self.history.append({
             "Quarter": self.quarter,
             "Interest Rate (%)": round(self.interest_rate, 2),
+            "Real Interest Rate (%)": round(self.interest_rate - self.inflation, 2),
             "Unemployment (%)": round(self.unemployment, 2),
             "Inflation (%)": round(self.inflation, 2),
             "GDP Growth (%)": round(self._last_growth, 2),
             "GDP ($B)": round(self.gdp, 1),
             "Federal Debt ($B)": round(self.debt, 1),
+            "Debt-to-GDP (%)": round(self.debt / self.gdp * 100.0, 1),
+            "Primary Balance ($B)": round(self._last_primary_balance, 1),
             "Output Gap (%)": round(self.output_gap, 2),
         })
 
@@ -130,6 +134,7 @@ class EconomyModel:
         interest_on_debt = self.debt * (self.interest_rate / 100.0) / 4.0
 
         primary_balance = income_tax_rev + corp_tax_rev - gov_other_spend - ei_spend
+        self._last_primary_balance = primary_balance
         self.debt = self.debt - primary_balance + interest_on_debt
 
         self._record()
@@ -189,16 +194,19 @@ model.corp_tax_rate = corp_tax
 model.ei_benefit = ei_benefit
 
 st.sidebar.caption(
-    "1 tick = 1 quarter · each step advances 1 year (4 ticks). "
+    "1 tick = 1 quarter, matching real Bank of Canada meeting cadence. "
     "Rate changes take ~2 quarters to fully hit the economy, like real policy lags."
 )
 
-col_btn1, col_btn2 = st.sidebar.columns(2)
-if col_btn1.button("▶ Advance 1 Year"):
+col_btn1, col_btn2, col_btn3 = st.sidebar.columns(3)
+if col_btn1.button("▶ 1 Quarter"):
+    model.step()
+
+if col_btn2.button("▶▶ 1 Year"):
     for _ in range(4):
         model.step()
 
-if col_btn2.button("🔄 Reset"):
+if col_btn3.button("🔄 Reset"):
     st.session_state.model = EconomyModel()
     st.rerun()
 
@@ -208,12 +216,13 @@ df = pd.DataFrame(model.history)
 if len(df) > 1:
     latest = df.iloc[-1]
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Unemployment", f"{latest['Unemployment (%)']}%")
     m2.metric("GDP Growth", f"{latest['GDP Growth (%)']}%")
     m3.metric("Inflation", f"{latest['Inflation (%)']}%")
     m4.metric("GDP Level", f"${latest['GDP ($B)']:,.1f}B")
     m5.metric("Federal Debt", f"${latest['Federal Debt ($B)']:,.1f}B")
+    m6.metric("Debt-to-GDP", f"{latest['Debt-to-GDP (%)']}%")
 
     st.divider()
 
@@ -248,6 +257,37 @@ if len(df) > 1:
         dtick2 = max(1, round(n_quarters / 10))
         fig2.update_xaxes(dtick=dtick2, tick0=0, tickformat="d")
         st.plotly_chart(fig2, width="stretch")
+
+    c3, c4 = st.columns(2)
+
+    with c3:
+        st.subheader("Fiscal Sustainability")
+        fig3 = px.line(
+            df,
+            x="Quarter",
+            y="Debt-to-GDP (%)",
+            title="Federal Debt as % of GDP",
+            labels={"value": "Percent (%)"},
+        )
+        fig3.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=40))
+        dtick3 = max(1, round(n_quarters / 10))
+        fig3.update_xaxes(dtick=dtick3, tick0=0, tickformat="d")
+        st.plotly_chart(fig3, width="stretch")
+
+    with c4:
+        st.subheader("Budget Balance")
+        fig4 = px.line(
+            df,
+            x="Quarter",
+            y="Primary Balance ($B)",
+            title="Primary Balance (surplus above zero, before interest)",
+            labels={"value": "$B / quarter"},
+        )
+        fig4.add_hline(y=0, line_dash="dot", line_color="gray")
+        fig4.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=40))
+        dtick4 = max(1, round(n_quarters / 10))
+        fig4.update_xaxes(dtick=dtick4, tick0=0, tickformat="d")
+        st.plotly_chart(fig4, width="stretch")
 
     st.subheader("Simulation Ledger")
     st.dataframe(df.tail(15), width="stretch")
