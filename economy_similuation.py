@@ -5,52 +5,131 @@ import streamlit as st
 
 # Set page config
 st.set_page_config(
-    page_title="Canada Macro Policy Simulator", layout="wide"
+    page_title="Macro Policy Simulator", layout="wide"
 )
 
 # Fixed seed so shocks are reproducible run-to-run for a given policy path
 random.seed(42)
 
 
+# ---------------------------------------------------------------------------
+# COUNTRY CALIBRATION PROFILES
+#
+# Parameters with a clean single real-world analog (NAIRU, neutral rate,
+# Okun's coefficient, GDP/debt levels, policy lag) are set from cited
+# published estimates - see README.md for full sourcing.
+#
+# Fiscal composition parameters (LABOR_SHARE, PROFIT_SHARE,
+# GOV_SPENDING_SHARE) are necessarily stylized: this model has only two
+# tax instruments (income + corporate), while real federal budgets also
+# collect consumption taxes we don't represent. Rather than inflate the
+# corporate tax base to force-match official total revenue, spending
+# shares are calibrated so the BASELINE DEFICIT matches each country's
+# actual reported deficit-to-GDP ratio - the number that actually drives
+# gameplay - even though the underlying revenue composition is simplified.
+# ---------------------------------------------------------------------------
+CALIBRATIONS = {
+    "Canada": dict(
+        currency="CAD",
+        neutral_nominal_rate=2.75,      # BoC 2025 neutral rate assessment (2.25-3.25%)
+        target_inflation=2.0,           # BoC inflation target
+        natural_unemployment=5.5,       # Consensus pre-2020 Canadian NAIRU estimate
+        potential_growth_q=0.003,       # ~1.2%/yr, reflecting BoC's slower 2025 potential growth outlook
+        okun_coefficient=0.40,          # Ball, Leigh & Loungani (2013), G7 average
+        rate_lag_quarters=3,            # BoC: effect "economically significant by 3rd-4th quarter"
+        inflation_lag_weight=0.39,      # Fillion & Léonard (1997) Canadian Phillips curve estimate
+        inflation_target_weight=0.61,
+        labor_share=0.45,
+        profit_share=0.15,
+        gov_spending_share=0.10,        # calibrated for ~1.8% GDP baseline deficit (actual FY24-25 figure)
+        base_income_tax=18.0,           # approx. average effective federal PIT rate
+        base_corp_tax=15.0,             # actual Canada federal general corporate tax rate
+        base_ei_benefit=3.0,            # $B/quarter per 1pt of unemployment
+        ei_range=(1.0, 10.0, 0.5),
+        starting_gdp=3075.0,            # $B CAD, implied by federal debt / 41.2% debt-to-GDP (FY24-25 Annual Financial Report)
+        starting_debt=1266.5,           # $B CAD, federal debt at March 31, 2025
+    ),
+    "United States": dict(
+        currency="USD",
+        neutral_nominal_rate=3.0,       # Within HLW (~2.84%) / Cleveland Fed (~3.7%) / BoC cross-country range
+        target_inflation=2.0,           # Fed inflation target
+        natural_unemployment=4.5,       # CBO 2025-26 NAIRU estimate
+        potential_growth_q=0.005,       # ~2%/yr, standard US potential growth estimate
+        okun_coefficient=0.45,          # Ball, Leigh & Loungani (2013), US-specific estimate
+        rate_lag_quarters=4,            # Commonly cited ~1yr lag to peak output effect
+        inflation_lag_weight=0.55,      # More backward-looking; less rigorously sourced than the Canadian figure
+        inflation_target_weight=0.45,
+        labor_share=0.50,
+        profit_share=0.12,
+        gov_spending_share=0.146,       # calibrated for ~6.8% GDP baseline deficit (actual 2025 figure)
+        base_income_tax=14.0,           # approx. average effective federal individual income tax rate
+        base_corp_tax=21.0,             # actual US federal corporate tax rate (post-TCJA)
+        base_ei_benefit=28.0,           # $B/quarter per 1pt of unemployment (~9.4x Canada, matching GDP ratio)
+        ei_range=(10.0, 100.0, 5.0),
+        starting_gdp=29000.0,           # $B USD, 2025 nominal GDP estimate
+        starting_debt=36000.0,          # $B USD, ~124% debt-to-GDP
+    ),
+}
+
+# Shared structural elasticities - standard textbook/DSGE-calibration magnitudes,
+# not fitted per-country. See README.md for discussion.
+IS_PERSISTENCE = 0.75
+IS_RATE_SENSITIVITY = 0.55
+PHILLIPS_OUTPUT_GAP_SLOPE = 0.30
+
+# Fiscal multipliers - literature-cited ranges (see README.md):
+#   income tax: Barro & Redlick (2011) ~1.1; CBO 0.3-1.5
+#   EI/transfers: CBO transfer-payment range, high end ~1.7-2.1 (high MPC recipients)
+#   corporate tax: FAVAR estimate ~0.83 (Heterogeneous Responses to US Narrative Tax Changes)
+INCOME_TAX_MULTIPLIER = 1.1
+EI_MULTIPLIER = 1.7
+CORP_TAX_MULTIPLIER = 0.83
+
+
 class EconomyModel:
     """Reduced-form macro model: IS curve (demand) + Phillips curve
     (inflation) + Okun's law (unemployment), with a lagged monetary
-    transmission channel. This replaces the old agent-based version so
-    that interest-rate changes produce the textbook, predictable
-    transmission a policy simulator needs, instead of emergent noise
-    from thousands of individual hiring/spending decisions.
+    transmission channel and literature-calibrated fiscal multipliers.
+    Supports Canada and US calibration profiles - see CALIBRATIONS above
+    and README.md for full sourcing.
     """
 
-    # --- Structural calibration (not player-controlled) ---
-    POTENTIAL_GROWTH_Q = 0.005      # ~2%/yr potential growth, compounded quarterly
-    NEUTRAL_REAL_RATE = 2.0         # % - real policy rate consistent with stable inflation
-    TARGET_INFLATION = 2.0          # % - central bank's inflation target
-    NATURAL_UNEMPLOYMENT = 5.0      # % - NAIRU
-    LABOR_SHARE = 0.55              # share of quarterly output subject to income tax
-    PROFIT_SHARE = 0.15             # share of quarterly output subject to corp tax
-    GOV_SPENDING_SHARE = 0.15       # baseline non-EI government spending, % of output
-    RATE_LAG_QUARTERS = 2           # monetary policy transmission lag
+    def __init__(self, country="Canada"):
+        cal = CALIBRATIONS[country]
+        self.country = country
+        self.currency = cal["currency"]
 
-    # Baselines fiscal levers are compared against, to compute stimulus/drag
-    BASE_INCOME_TAX = 20.0
-    BASE_CORP_TAX = 20.0
-    BASE_EI_BENEFIT = 3.0
+        # Structural calibration (not player-controlled)
+        self.NEUTRAL_REAL_RATE = cal["neutral_nominal_rate"] - cal["target_inflation"]
+        self.TARGET_INFLATION = cal["target_inflation"]
+        self.NATURAL_UNEMPLOYMENT = cal["natural_unemployment"]
+        self.POTENTIAL_GROWTH_Q = cal["potential_growth_q"]
+        self.OKUN_COEFFICIENT = cal["okun_coefficient"]
+        self.RATE_LAG_QUARTERS = cal["rate_lag_quarters"]
+        self.INFLATION_LAG_WEIGHT = cal["inflation_lag_weight"]
+        self.INFLATION_TARGET_WEIGHT = cal["inflation_target_weight"]
+        self.LABOR_SHARE = cal["labor_share"]
+        self.PROFIT_SHARE = cal["profit_share"]
+        self.GOV_SPENDING_SHARE = cal["gov_spending_share"]
+        self.BASE_INCOME_TAX = cal["base_income_tax"]
+        self.BASE_CORP_TAX = cal["base_corp_tax"]
+        self.BASE_EI_BENEFIT = cal["base_ei_benefit"]
+        self.ei_range = cal["ei_range"]
 
-    def __init__(self):
-        # Policy levers (player controlled) - sensible starting stance
-        self.interest_rate = 4.0        # nominal rate; real = 4.0 - 2.0 = neutral
+        # Policy levers (player controlled) - start at baseline
+        self.interest_rate = cal["neutral_nominal_rate"]
         self.income_tax_rate = self.BASE_INCOME_TAX
         self.corp_tax_rate = self.BASE_CORP_TAX
-        self.ei_benefit = self.BASE_EI_BENEFIT   # $B / quarter per 1pt of unemployment
+        self.ei_benefit = self.BASE_EI_BENEFIT
 
         # State
         self.quarter = 0
         self.output_gap = 0.0
         self.inflation = self.TARGET_INFLATION
         self.unemployment = self.NATURAL_UNEMPLOYMENT
-        self.potential_gdp = 2100.0     # $B, annualized (~ Canada-scale)
-        self.gdp = 2100.0
-        self.debt = 1200.0              # $B, federal debt level
+        self.potential_gdp = cal["starting_gdp"]
+        self.gdp = cal["starting_gdp"]
+        self.debt = cal["starting_debt"]
         self._last_growth = 0.0
         self._last_primary_balance = 0.0
 
@@ -87,19 +166,29 @@ class EconomyModel:
         else:
             real_rate_effective = self.NEUTRAL_REAL_RATE
 
-        # --- Fiscal impulse from tax/benefit levers (deviation from baseline) ---
-        fiscal_impulse = (
-            0.06 * (self.BASE_INCOME_TAX - self.income_tax_rate)   # tax cut -> stimulus
-            + 0.15 * (self.ei_benefit - self.BASE_EI_BENEFIT)      # richer EI -> stimulus
-            + 0.02 * (self.BASE_CORP_TAX - self.corp_tax_rate)     # corp tax cut -> mild stimulus
+        # --- Fiscal impulse: literature multiplier x fiscal shock (% of GDP) ---
+        # Shock = size of the revenue/spending change as a share of GDP;
+        # long-run output-gap contribution = multiplier x shock (see README).
+        # Each quarter only (1 - IS_PERSISTENCE) of that long-run effect
+        # lands immediately, converging to the full effect over time.
+        income_tax_shock_pct = (self.BASE_INCOME_TAX - self.income_tax_rate) * self.LABOR_SHARE / 100.0
+        corp_tax_shock_pct = (self.BASE_CORP_TAX - self.corp_tax_rate) * self.PROFIT_SHARE / 100.0
+        quarterly_output_prior = self.gdp / 4.0
+        ei_shock_dollars = (self.ei_benefit - self.BASE_EI_BENEFIT) * self.NATURAL_UNEMPLOYMENT
+        ei_shock_pct = ei_shock_dollars / quarterly_output_prior
+
+        fiscal_impulse = (1 - IS_PERSISTENCE) * (
+            INCOME_TAX_MULTIPLIER * income_tax_shock_pct * 100.0
+            + EI_MULTIPLIER * ei_shock_pct * 100.0
+            + CORP_TAX_MULTIPLIER * corp_tax_shock_pct * 100.0
         )
 
         demand_shock = random.gauss(0, 0.08)
 
         # --- IS curve: output gap ---
         self.output_gap = (
-            0.75 * self.output_gap
-            - 0.55 * (real_rate_effective - self.NEUTRAL_REAL_RATE)
+            IS_PERSISTENCE * self.output_gap
+            - IS_RATE_SENSITIVITY * (real_rate_effective - self.NEUTRAL_REAL_RATE)
             + fiscal_impulse
             + demand_shock
         )
@@ -108,15 +197,15 @@ class EconomyModel:
         # --- Phillips curve: inflation ---
         supply_shock = random.gauss(0, 0.05)
         self.inflation = (
-            0.65 * self.inflation
-            + 0.35 * self.TARGET_INFLATION
-            + 0.30 * self.output_gap
+            self.INFLATION_LAG_WEIGHT * self.inflation
+            + self.INFLATION_TARGET_WEIGHT * self.TARGET_INFLATION
+            + PHILLIPS_OUTPUT_GAP_SLOPE * self.output_gap
             + supply_shock
         )
         self.inflation = max(-2.0, min(12.0, self.inflation))
 
         # --- Okun's law: unemployment ---
-        self.unemployment = self.NATURAL_UNEMPLOYMENT - 0.5 * self.output_gap
+        self.unemployment = self.NATURAL_UNEMPLOYMENT - self.OKUN_COEFFICIENT * self.output_gap
         self.unemployment = max(1.0, min(20.0, self.unemployment))
 
         # --- GDP level (annualized), potential compounds, actual tracks the gap ---
@@ -141,14 +230,18 @@ class EconomyModel:
 
 
 # --- STREAMLIT DASHBOARD UI ---
-st.title("🏦 Sim-Fed: Canadian Macroeconomic Policy Simulator")
+st.title("🏦 Sim-Fed: Macroeconomic Policy Simulator")
 st.markdown(
-    "Take control of the Bank of Canada and Finance Department. Adjust policy levers and observe macro outcomes."
+    "Take control of a central bank and finance ministry. Adjust policy levers and observe macro outcomes."
 )
 
-# Initialize Session State for Model Persistence
-if "model" not in st.session_state:
-    st.session_state.model = EconomyModel()
+country = st.sidebar.selectbox("Country", list(CALIBRATIONS.keys()))
+
+# Reset the model whenever the country selection changes, since starting
+# conditions (GDP, debt, NAIRU, etc.) differ per profile.
+if "model" not in st.session_state or st.session_state.get("country") != country:
+    st.session_state.model = EconomyModel(country=country)
+    st.session_state.country = country
 
 model = st.session_state.model
 
@@ -179,12 +272,13 @@ corp_tax = st.sidebar.slider(
     step=1.0,
 )
 
+ei_min, ei_max, ei_step = model.ei_range
 ei_benefit = st.sidebar.slider(
-    "EI Benefit ($B / quarter per 1pt unemployment)",
-    min_value=1.0,
-    max_value=10.0,
+    f"EI/UI Benefit (${model.currency} B / quarter per 1pt unemployment)",
+    min_value=ei_min,
+    max_value=ei_max,
     value=float(model.ei_benefit),
-    step=0.5,
+    step=ei_step,
 )
 
 # Apply Control Settings to Active Model
@@ -194,8 +288,8 @@ model.corp_tax_rate = corp_tax
 model.ei_benefit = ei_benefit
 
 st.sidebar.caption(
-    "1 tick = 1 quarter, matching real Bank of Canada meeting cadence. "
-    "Rate changes take ~2 quarters to fully hit the economy, like real policy lags."
+    f"1 tick = 1 quarter, matching real central bank meeting cadence. "
+    f"Rate changes take ~{model.RATE_LAG_QUARTERS} quarters to fully hit the economy, like real policy lags."
 )
 
 col_btn1, col_btn2, col_btn3 = st.sidebar.columns(3)
@@ -207,7 +301,7 @@ if col_btn2.button("▶▶ 1 Year"):
         model.step()
 
 if col_btn3.button("🔄 Reset"):
-    st.session_state.model = EconomyModel()
+    st.session_state.model = EconomyModel(country=country)
     st.rerun()
 
 # --- MAIN DISPLAY METRICS ---
@@ -228,6 +322,7 @@ if len(df) > 1:
 
     # --- CHARTS ---
     c1, c2 = st.columns(2)
+    n_quarters = len(df)
 
     with c1:
         st.subheader("Labor Market & Interest Rates")
@@ -239,7 +334,6 @@ if len(df) > 1:
             labels={"value": "Percent (%)", "variable": "Metric"},
         )
         fig1.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=40))
-        n_quarters = len(df)
         dtick1 = max(1, round(n_quarters / 10))
         fig1.update_xaxes(dtick=dtick1, tick0=0, tickformat="d")
         st.plotly_chart(fig1, width="stretch")
@@ -292,4 +386,4 @@ if len(df) > 1:
     st.subheader("Simulation Ledger")
     st.dataframe(df.tail(15), width="stretch")
 else:
-    st.info("Click ▶ 1 Quarter or ▶▶ 1 Year in the sidebar to begin.")
+    st.info("Click **1 Quarter** or **1 Year** in the sidebar to begin.")
